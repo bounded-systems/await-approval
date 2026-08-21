@@ -1,39 +1,76 @@
 name: await-approval
 description: >
-  Pause the job on a GitHub issue until an allowlisted approver comments approval — the
-  in-house replacement for trstringer/manual-approval (infra#62), so no third-party code
-  runs in privileged lanes. Opens an issue, polls its comments, and proceeds only when a
-  listed approver writes approve/approved/lgtm/yes; deny/denied/no (or the deadline) fails
-  the step. Comment authors NOT on the approvers list are ignored entirely, so a drive-by
-  comment can neither release nor cancel the gate. Requires `issues: write` on the job and
-  a GH_TOKEN (the ambient github.token) — no new secret.
+  In-house manual-approval gate for GitHub Actions (infra#62), so no third-party code runs in
+  privileged lanes. Three modes. `wait` (default) is the original: open an issue and poll it,
+  holding the job. `open` + `verify` are the non-blocking split (#9): `open` creates the issue
+  and exits, an `issue_comment`-triggered job later calls `verify`, and no runner idles through
+  human latency. In every mode only authors on the `approvers` allowlist count, and a comment
+  must be EXACTLY one keyword after whitespace-stripping — a drive-by comment can neither
+  release nor cancel a gate. Requires `issues: write` and the ambient github.token.
 inputs:
   approvers:
     description: Comma-separated GitHub logins whose comments count. Required.
     required: true
+  mode:
+    description: >
+      `wait` (default, unchanged) — open an issue and block until a verdict.
+      `open` — create the issue, output its number, exit immediately.
+      `verify` — judge an existing issue named by `issue-number`, without waiting.
+    required: false
+    default: wait
   issue-title:
-    description: Title for the approval issue.
-    required: true
+    description: Title for the approval issue. Required for `wait` and `open`.
+    required: false
+    default: ""
   issue-body:
     description: Body for the approval issue (what is being approved, stated plainly).
-    required: true
+    required: false
+    default: ""
+  issue-number:
+    description: The approval issue to judge. Required for `verify`.
+    required: false
+    default: ""
+  bind:
+    description: >
+      Opaque string identifying WHAT is being approved — a commit SHA, a registry digest, or
+      both. `open` records it in the issue; `verify` refuses unless the caller presents the
+      same value. Without it a split gate approves a moment in time rather than an artifact,
+      and main can move between the request and the resume. Optional but strongly advised.
+    required: false
+    default: ""
+  marker-label:
+    description: Label proving an issue was opened BY this action, not by a human lookalike.
+    required: false
+    default: awaiting-approval
   timeout-minutes:
-    description: How long to wait before giving up (fail closed). Keep <= the job timeout.
+    description: "`wait` only: how long to block before failing closed. Keep <= the job timeout."
     required: false
     default: "50"
   poll-seconds:
-    description: Seconds between comment polls.
+    description: "`wait` only: seconds between comment polls."
     required: false
     default: "15"
+outputs:
+  issue-number:
+    description: The approval issue's number (`open` and `wait`).
+    value: ${{ steps.gate.outputs.issue-number }}
+  verdict:
+    description: "`approved by <login>` on success; the step fails otherwise."
+    value: ${{ steps.gate.outputs.verdict }}
 runs:
   using: composite
   steps:
-    - name: Open the approval issue and wait
+    - name: Approval gate
+      id: gate
       shell: bash
       env:
+        MODE: ${{ inputs.mode }}
         APPROVERS: ${{ inputs.approvers }}
         ISSUE_TITLE: ${{ inputs.issue-title }}
         ISSUE_BODY: ${{ inputs.issue-body }}
+        ISSUE_NUMBER: ${{ inputs.issue-number }}
+        BIND: ${{ inputs.bind }}
+        MARKER: ${{ inputs.marker-label }}
         TIMEOUT_MIN: ${{ inputs.timeout-minutes }}
         POLL_S: ${{ inputs.poll-seconds }}
         GH_TOKEN: ${{ github.token }}
@@ -42,37 +79,125 @@ runs:
       run: |
         set -euo pipefail
 
-        body="$(printf '%s\n\n---\nRun awaiting this approval: %s\nApprovers: %s\nReply `approve`/`approved`/`lgtm`/`yes` to proceed, `deny`/`denied`/`no` to cancel.' \
-          "$ISSUE_BODY" "$RUN_URL" "$APPROVERS")"
-        url="$(gh issue create --repo "$REPO" --title "$ISSUE_TITLE" --body "$body")"
-        num="${url##*/}"
-        echo "::notice::awaiting approval on $url (timeout ${TIMEOUT_MIN}m)"
+        # ── ONE matcher, used by both `wait` and `verify` ────────────────────────────────
+        # Two copies of this would drift, and a gate whose two halves disagree about what
+        # counts as approval is worse than either half alone. Whole-body match after
+        # lowercasing and stripping ALL whitespace: a body carrying anything besides the
+        # keyword — a signature, a footer, an explanation — is NOT a verdict. That
+        # strictness is load-bearing (see README: it is what keeps an automated caller,
+        # whose comments carry an appended footer, from operating a human gate).
+        verdict_of() {
+          case "$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')" in
+            approve|approved|lgtm|yes) echo approved ;;
+            deny|denied|no)            echo denied ;;
+            *)                         echo "" ;;
+          esac
+        }
 
-        # Poll comments; only authors on the allowlist count, matched as whole logins.
-        deadline=$(( $(date +%s) + TIMEOUT_MIN * 60 ))
-        verdict=""
-        while [ "$(date +%s)" -lt "$deadline" ]; do
-          # login<TAB>body per comment, newlines in bodies flattened.
+        # Scan an issue's comments once. Echoes "approved <login>" / "denied <login>", or
+        # nothing. Only allowlisted authors are considered, matched as WHOLE logins.
+        scan() {
           while IFS=$'\t' read -r login text; do
             [ -n "$login" ] || continue
             case ",$APPROVERS," in *",$login,"*) ;; *) continue ;; esac
-            word="$(printf '%s' "$text" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')"
-            case "$word" in
-              approve|approved|lgtm|yes) verdict="approved by $login"; break ;;
-              deny|denied|no)            verdict="DENIED by $login";   break ;;
-            esac
-          done < <(gh api "repos/$REPO/issues/$num/comments?per_page=100" \
+            v="$(verdict_of "$text")"
+            [ -n "$v" ] || continue
+            echo "$v $login"
+            return 0
+          done < <(gh api "repos/$REPO/issues/$1/comments?per_page=100" \
                     --jq '.[] | [.user.login, (.body | gsub("\\s+"; " "))] | @tsv' || true)
-          [ -z "$verdict" ] || break
-          sleep "$POLL_S"
-        done
+        }
 
-        if [ "${verdict#approved}" != "$verdict" ]; then
-          gh issue close "$num" --repo "$REPO" --comment "✅ ${verdict} — proceeding. $RUN_URL"
-          echo "::notice::${verdict}"
+        # The issue body carries the binding as an HTML comment: invisible when rendered,
+        # exact when grepped.
+        bind_line() { [ -n "$BIND" ] && printf '\n<!-- await-approval:bind %s -->' "$BIND" || true; }
+
+        open_issue() {
+          [ -n "$ISSUE_TITLE" ] || { echo "::error::mode=$MODE needs issue-title"; exit 2; }
+          # Create the label deliberately rather than relying on it existing: `gh issue
+          # create --label` fails outright on an unknown label, which would fail the gate
+          # for a reason unrelated to approval.
+          gh label create "$MARKER" --repo "$REPO" --color ededed \
+            --description "Opened by await-approval; do not create by hand" >/dev/null 2>&1 || true
+          body="$(printf '%s%s\n\n---\nRun awaiting this approval: %s\nApprovers: %s\nReply `approve`/`approved`/`lgtm`/`yes` to proceed, `deny`/`denied`/`no` to cancel.\nThe comment must be that word and NOTHING else.' \
+            "$ISSUE_BODY" "$(bind_line)" "$RUN_URL" "$APPROVERS")"
+          url="$(gh issue create --repo "$REPO" --title "$ISSUE_TITLE" --body "$body" --label "$MARKER")"
+          echo "${url##*/}"
+        }
+
+        case "$MODE" in
+          wait)
+            num="$(open_issue)"
+            echo "issue-number=$num" >> "$GITHUB_OUTPUT"
+            echo "::notice::awaiting approval on $REPO#$num (timeout ${TIMEOUT_MIN}m)"
+            deadline=$(( $(date +%s) + TIMEOUT_MIN * 60 ))
+            result=""
+            while [ "$(date +%s)" -lt "$deadline" ]; do
+              result="$(scan "$num")"
+              [ -z "$result" ] || break
+              sleep "$POLL_S"
+            done
+            ;;
+
+          open)
+            num="$(open_issue)"
+            echo "issue-number=$num" >> "$GITHUB_OUTPUT"
+            echo "::notice::approval requested on $REPO#$num — this run is DONE; a comment resumes it."
+            exit 0
+            ;;
+
+          verify)
+            num="$ISSUE_NUMBER"
+            [ -n "$num" ] || { echo "::error::mode=verify needs issue-number"; exit 2; }
+            echo "issue-number=$num" >> "$GITHUB_OUTPUT"
+
+            meta="$(gh api "repos/$REPO/issues/$num" \
+              --jq '[.user.login, .state, ([.labels[].name] | join(",")), .body] | @tsv')"
+            IFS=$'\t' read -r author state labels body <<<"$meta"
+
+            # PROVENANCE. Without these three an approval request is forgeable: anyone who
+            # can open an issue could file a lookalike and approve their own.
+            [ "$author" = "github-actions[bot]" ] \
+              || { echo "::error::issue #$num was opened by '$author', not this action — refusing"; exit 1; }
+            case ",$labels," in *",$MARKER,"*) ;; *)
+              echo "::error::issue #$num does not carry the '$MARKER' label — refusing"; exit 1 ;;
+            esac
+            # REPLAY. A closed issue has already been acted on; a second `approve` on it
+            # must not deploy again.
+            [ "$state" = "open" ] \
+              || { echo "::error::issue #$num is $state — already acted on, refusing to replay"; exit 1; }
+
+            # ARTIFACT BINDING. The whole hazard of a split gate: the approval was given for
+            # one state and the resume runs against whatever is current.
+            if [ -n "$BIND" ]; then
+              printf '%s' "$body" | grep -qF "<!-- await-approval:bind $BIND -->" \
+                || { echo "::error::issue #$num was approved for a DIFFERENT artifact than the one presented — refusing"; \
+                     echo "::error::  presented: $BIND"; exit 1; }
+            fi
+
+            result="$(scan "$num")"
+            [ -n "$result" ] || { echo "::error::issue #$num carries no verdict from an allowlisted approver"; exit 1; }
+            ;;
+
+          *) echo "::error::mode must be wait, open or verify (got '$MODE')"; exit 2 ;;
+        esac
+
+        # ── shared outcome handling for `wait` and `verify` ──────────────────────────────
+        set -- ${result:-}
+        outcome="${1:-}"; who="${2:-}"
+
+        if [ "$outcome" = "approved" ]; then
+          echo "verdict=approved by $who" >> "$GITHUB_OUTPUT"
+          gh issue close "$num" --repo "$REPO" --comment "✅ approved by $who — proceeding. $RUN_URL"
+          # Lock so the acted-on issue cannot accumulate further verdicts. Best-effort: a
+          # failure here must not fail an approved run.
+          gh issue lock "$num" --repo "$REPO" --reason resolved >/dev/null 2>&1 || true
+          echo "::notice::approved by $who"
           exit 0
         fi
-        if [ -z "$verdict" ]; then verdict="timed out after ${TIMEOUT_MIN}m with no approval"; fi
-        gh issue close "$num" --repo "$REPO" --comment "⛔ ${verdict} — run cancelled. $RUN_URL"
-        echo "::error::await-approval: ${verdict}"
+
+        if [ "$outcome" = "denied" ]; then reason="DENIED by $who"
+        else reason="timed out after ${TIMEOUT_MIN}m with no approval"; fi
+        gh issue close "$num" --repo "$REPO" --comment "⛔ ${reason} — run cancelled. $RUN_URL"
+        echo "::error::await-approval: ${reason}"
         exit 1
